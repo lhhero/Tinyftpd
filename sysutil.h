@@ -4,6 +4,7 @@
 #include "common.h"
 
 /*系统工具模块，目前与系统调用相关的函数还没有在这里封装完毕*/
+int tcp_client(unsigned short port);
 int tcp_server(const char *host, unsigned short port);
 int getlocalip(char *ip);
 
@@ -23,6 +24,8 @@ ssize_t readline(int sockfd, void *buf, size_t maxline);
 void send_fd(int sock_fd, int fd);
 int recv_fd(const int sock_fd);
 
+const char* statbuf_get_perms(struct stat *sbuf);
+const char* statbuf_get_date(struct stat *sbuf);
 
 #endif /* _SYS_UTIL_H_ */
 
