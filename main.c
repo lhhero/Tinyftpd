@@ -19,9 +19,20 @@ int main()
 
 	int listenfd = tcp_server(tunable_listen_address,tunable_listen_port);
 
-	session_t sess = {
-		-1,"","","",
-		-1,-1
+	session_t sess = 
+	{
+		/* 控制连接 */
+		0, -1, "", "", "",
+		/* 数据连接 */
+		NULL, -1, -1, 0,
+		/* 限速 */
+		0, 0, 0, 0,
+		/* 父子进程通道 */
+		-1, -1,
+		/* FTP协议状态 */
+		0, 0, NULL, 0,
+		/* 连接数限制 */
+		0, 0
 	};
 
 	while(1)
