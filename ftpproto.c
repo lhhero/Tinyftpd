@@ -4,6 +4,7 @@
 #include "str.h"
 #include "ftpcodes.h"
 #include "tunable.h"
+#include "privsock.h"
 
 void ftp_reply(session_t *sess, int status, const char *text);
 void ftp_lreply(session_t *sess, int status, const char *text);
@@ -232,9 +233,9 @@ int port_active(session_t *sess)
 {
 	if (sess->port_addr)
 	{
-		if(pasv_active(sess))
+		if (pasv_active(sess))
 		{
-			fprintf(stderr,"both port and pasv are cctive");
+			fprintf(stderr, "both port an pasv are active");
 			exit(EXIT_FAILURE);
 		}
 		return 1;
@@ -245,11 +246,24 @@ int port_active(session_t *sess)
 
 int pasv_active(session_t *sess)
 {
-	if(sess->pasv_listen_fd != -1)
+	
+	/*if (sess->pasv_listen_fd != -1)
 	{
-		if(port_active(sess))
+		if (port_active(sess))
 		{
-			fprintf(stderr,"both port and pasv are cctive");
+			fprintf(stderr, "both port an pasv are active");
+			exit(EXIT_FAILURE);
+		}
+		return 1;
+	}*/
+	
+	priv_sock_send_cmd(sess->child_fd, PRIV_SOCK_PASV_ACTIVE);
+	int active = priv_sock_get_int(sess->child_fd);
+	if (active)
+	{
+		if (port_active(sess))
+		{
+			fprintf(stderr, "both port an pasv are active");
 			exit(EXIT_FAILURE);
 		}
 		return 1;
@@ -257,6 +271,49 @@ int pasv_active(session_t *sess)
 	return 0;
 }
 
+int get_port_fd(session_t *sess)
+{
+	/*
+	向nobody发送PRIV_SOCK_GET_DATA_SOCK命令        1
+	向nobody发送一个整数port		               4
+	向nobody发送一个字符串ip                       不定长
+	*/
+
+	priv_sock_send_cmd(sess->child_fd, PRIV_SOCK_GET_DATA_SOCK);
+
+	unsigned short port = ntohs(sess->port_addr->sin_port);
+	char *ip = inet_ntoa(sess->port_addr->sin_addr);
+	priv_sock_send_int(sess->child_fd, (int)port);
+	priv_sock_send_buf(sess->child_fd, ip, strlen(ip));
+
+	char res = priv_sock_get_result(sess->child_fd);
+	if (res == PRIV_SOCK_RESULT_BAD)
+	{
+		return 0;
+	}
+	else if (res == PRIV_SOCK_RESULT_OK)
+	{
+		sess->data_fd = priv_sock_recv_fd(sess->child_fd);
+	}
+
+	return 1;
+}
+
+int get_pasv_fd(session_t *sess)
+{
+	priv_sock_send_cmd(sess->child_fd, PRIV_SOCK_PASV_ACCEPT);
+	char res = priv_sock_get_result(sess->child_fd);
+	if (res == PRIV_SOCK_RESULT_BAD)
+	{
+		return 0;
+	}
+	else if (res == PRIV_SOCK_RESULT_OK)
+	{
+		sess->data_fd = priv_sock_recv_fd(sess->child_fd);
+	}
+
+	return 1;
+}
 
 int get_transfer_fd(session_t *sess)
 {
@@ -268,17 +325,32 @@ int get_transfer_fd(session_t *sess)
 	}
 
 	int ret = 1;
+
 	// 如果是主动模式
 	if (port_active(sess))
 	{
+
+		/*
+		socket
+		bind 20
+		connect
+		*/
+		// tcp_client(20);
+
+		/*
 		int fd = tcp_client(0);
-		if(connect_timeout(fd,sess->port_addr,tunable_connect_timeout) < 0)
+		if (connect_timeout(fd, sess->port_addr, tunable_connect_timeout) < 0)
 		{
 			close(fd);
 			return 0;
-
 		}
-		sess->data_fd = fd;
+
+		sess->data_fd = fd;*/
+		
+		if (get_port_fd(sess) == 0)
+		{
+			ret = 0;
+		}
 	}
 
 	//如果是被动模式
@@ -293,6 +365,7 @@ int get_transfer_fd(session_t *sess)
 		sess->data_fd = fd;
 	}
 
+	
 	if (sess->port_addr)
 	{
 		free(sess->port_addr);
@@ -300,8 +373,8 @@ int get_transfer_fd(session_t *sess)
 	}
 
 	return ret;
-
 }
+
 
 static void do_user(session_t *sess)
 {

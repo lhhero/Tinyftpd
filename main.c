@@ -17,6 +17,7 @@ int main()
 		printf("tunable_listen_address=NULL\n");
 	printf("%s\n",tunable_listen_address);
 
+	signal(SIGCHLD,SIG_IGN);
 	int listenfd = tcp_server(tunable_listen_address,tunable_listen_port);
 
 	session_t sess = 
