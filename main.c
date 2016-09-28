@@ -11,12 +11,19 @@ int main()
 		exit(EXIT_FAILURE);
 	}
 
-	parseconf_load_file("Tinyftpd.conf");
+
+	parseconf_load_file(TINYFTPD_CONF);
+	if(tunable_listen_address == NULL)
+		printf("tunable_listen_address=NULL\n");
+	printf("%s\n",tunable_listen_address);
+
 	int listenfd = tcp_server(tunable_listen_address,tunable_listen_port);
+
 	session_t sess = {
 		-1,"","","",
 		-1,-1
 	};
+
 	while(1)
 	{
 		int conn;

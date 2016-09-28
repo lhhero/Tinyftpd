@@ -7,6 +7,8 @@ typedef struct session{
 	char cmdline[MAX_COMMAND_LINE];
 	char cmd[MAX_COMMAND];
 	char arg[MAX_ARG];
+	
+	uid_t uid;
 	//父子通道
 	int parent_fd;
 	int child_fd;
