@@ -1,7 +1,7 @@
 CC=gcc
 CFLAGS=-Wall -g
 BIN=Tinyftpd
-OBJS=main.o sysutil.o session.o ftpproto.o privparent.o
+OBJS=main.o sysutil.o session.o ftpproto.o privparent.o str.o tunable.o parseconf.o
 LIBS=-lcrypt
 
 $(BIN):$(OBJS)

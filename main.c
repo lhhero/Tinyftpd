@@ -1,8 +1,8 @@
 #include "common.h"
 #include "sysutil.h"
 #include "session.h"
-
-
+#include "tunable.h"
+#include "parseconf.h"
 int main()
 {
 	if(getuid() != 0)
@@ -11,7 +11,8 @@ int main()
 		exit(EXIT_FAILURE);
 	}
 
-	int listenfd = tcp_server(NULL,5188);
+	parseconf_load_file("Tinyftpd.conf");
+	int listenfd = tcp_server(tunable_listen_address,tunable_listen_port);
 	session_t sess = {
 		-1,"","","",
 		-1,-1
