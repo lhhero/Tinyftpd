@@ -172,6 +172,62 @@ void ftp_lreply(session_t *sess, int status, const char *text)
 	writen(sess->ctrl_fd, buf, strlen(buf));
 }
 
+void limit_rate(session_t *sess, int bytes_transfered, int is_upload)
+{
+	sess->data_process = 1;
+
+	// 睡眠时间 = (当前传输速度 / 最大传输速度 – 1) * 当前传输时间;
+	long curr_sec = get_time_sec();
+	long curr_usec = get_time_usec();
+
+	double elapsed;
+	elapsed = (double)(curr_sec - sess->bw_transfer_start_sec);
+	elapsed += (double)(curr_usec - sess->bw_transfer_start_usec) / (double)1000000;
+	if (elapsed <= (double)0)
+	{
+		elapsed = (double)0.01;
+	}
+
+
+	// 计算当前传输速度
+	unsigned int bw_rate = (unsigned int)((double)bytes_transfered / elapsed);
+
+	double rate_ratio;
+	if (is_upload)
+	{
+		if (bw_rate <= sess->bw_upload_rate_max)
+		{
+			// 不需要限速
+			sess->bw_transfer_start_sec = curr_sec;
+			sess->bw_transfer_start_usec = curr_usec;
+			return;
+		}
+
+		rate_ratio = bw_rate / sess->bw_upload_rate_max;
+	}
+	else
+	{
+		if (bw_rate <= sess->bw_download_rate_max)
+		{
+			// 不需要限速
+			sess->bw_transfer_start_sec = curr_sec;
+			sess->bw_transfer_start_usec = curr_usec;
+			return;
+		}
+
+		rate_ratio = bw_rate / sess->bw_download_rate_max;
+	}
+
+	// 睡眠时间 = (当前传输速度 / 最大传输速度 – 1) * 当前传输时间;
+	double pause_time;
+	pause_time = (rate_ratio - (double)1) * elapsed;
+
+	nano_sleep(pause_time);
+
+	sess->bw_transfer_start_sec = get_time_sec();
+	sess->bw_transfer_start_usec = get_time_usec();
+
+}
 int list_common(session_t *sess, int detail)
 {
 	DIR *dir = opendir(".");
@@ -313,6 +369,9 @@ void upload_common(session_t *sess, int is_append)
 
 	char buf[1024];
 
+	sess->bw_transfer_start_sec = get_time_sec();
+	sess->bw_transfer_start_usec = get_time_usec();
+
 	while (1)
 	{
 		ret = read(sess->data_fd, buf, sizeof(buf));
@@ -333,6 +392,8 @@ void upload_common(session_t *sess, int is_append)
 			flag = 0;
 			break;
 		}
+
+		limit_rate(sess, ret, 1);
 
 		if (writen(fd, buf, ret) != ret)
 		{
@@ -365,6 +426,7 @@ void upload_common(session_t *sess, int is_append)
 	}
 
 }
+
 
 int port_active(session_t *sess)
 {
@@ -758,7 +820,6 @@ static void do_retr(session_t *sess)
 			break;
 		}
 	}*/
-	
 
 	//ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t count);
 	long long bytes_to_send = sbuf.st_size;
@@ -771,6 +832,8 @@ static void do_retr(session_t *sess)
 		bytes_to_send -= offset;
 	}
 
+	sess->bw_transfer_start_sec = get_time_sec();
+	sess->bw_transfer_start_usec = get_time_usec();
 	
 	while (bytes_to_send)
 	{
@@ -781,9 +844,12 @@ static void do_retr(session_t *sess)
 			flag = 2;
 			break;
 		}
-
+		
+		limit_rate(sess, ret, 0);
 		bytes_to_send -= ret;
 	}
+
+	
 
 	if (bytes_to_send == 0)
 	{

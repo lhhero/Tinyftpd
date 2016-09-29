@@ -36,6 +36,9 @@ int main()
 		0, 0
 	};
 
+	sess.bw_upload_rate_max = tunable_upload_max_rate;
+	sess.bw_download_rate_max = tunable_download_max_rate;
+	
 	while(1)
 	{
 		int conn;
