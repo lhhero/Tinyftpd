@@ -3,6 +3,8 @@
 #include "session.h"
 #include "tunable.h"
 #include "parseconf.h"
+
+extern session_t *p_sess;
 int main()
 {
 	if(getuid() != 0)
@@ -35,10 +37,10 @@ int main()
 		/* 连接数限制 */
 		0, 0
 	};
-
+	p_sess = &sess;
 	sess.bw_upload_rate_max = tunable_upload_max_rate;
 	sess.bw_download_rate_max = tunable_download_max_rate;
-	
+
 	while(1)
 	{
 		int conn;

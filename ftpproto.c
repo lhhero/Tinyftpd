@@ -12,6 +12,11 @@ int list_common(session_t *sess, int detail);
 int pasv_active(session_t *sess);
 int port_active(session_t *sess);
 
+void handle_sigalrm(int sig);
+void start_data_alarm(void);
+void start_cmdio_alarm(void);
+void handle_alarm_timeout(int sig);
+
 static void do_user(session_t *sess);
 static void do_pass(session_t *sess);
 static void do_cwd(session_t *sess);
@@ -103,6 +108,54 @@ static ftpcmd_t ctrl_cmds[] = {
 	{"ALLO",	NULL	}
 };
 
+session_t *p_sess;
+void handle_alarm_timeout(int sig)
+{
+	shutdown(p_sess->ctrl_fd, SHUT_RD);
+	ftp_reply(p_sess, FTP_IDLE_TIMEOUT, "Timeout.");
+	shutdown(p_sess->ctrl_fd, SHUT_WR);
+	exit(EXIT_FAILURE);
+}
+void start_cmdio_alarm(void)
+{
+	if (tunable_idle_session_timeout > 0)
+	{
+		// 安装信号
+		signal(SIGALRM, handle_alarm_timeout);
+		// 启动闹钟
+		alarm(tunable_idle_session_timeout);
+	}
+}
+void start_data_alarm(void)
+{
+	if (tunable_data_connection_timeout > 0)
+	{
+		// 安装信号
+		signal(SIGALRM, handle_sigalrm);
+		// 启动闹钟
+		alarm(tunable_data_connection_timeout);
+	}
+	else if (tunable_idle_session_timeout > 0)
+	{
+		// 关闭先前安装的闹钟
+		alarm(0);
+	}
+}
+void handle_sigalrm(int sig)
+{
+	if (!p_sess->data_process)
+	{
+		ftp_reply(p_sess, FTP_DATA_TIMEOUT, "Data timeout. Reconnect. Sorry.");
+		exit(EXIT_FAILURE);
+	}
+
+	// 否则，当前处于数据传输的状态收到了超时信号
+	p_sess->data_process = 0;
+	start_data_alarm();
+}
+
+
+
 void handler_child(session_t* sess)
 {
 	int ret;
@@ -113,6 +166,7 @@ void handler_child(session_t* sess)
 		memset(sess->cmd,0,MAX_COMMAND);
 		memset(sess->arg,0,MAX_ARG);
 
+		start_cmdio_alarm();
 		ret = readline(sess->ctrl_fd,sess->cmdline,sizeof(sess->cmdline));
 		if(ret == -1)
 			ERR_EXIT("readline");
@@ -425,6 +479,9 @@ void upload_common(session_t *sess, int is_append)
 		ftp_reply(sess, FTP_BADSENDNET, "Failure reading from network stream.");
 	}
 
+	// 重新开启控制连接通道闹钟
+	start_cmdio_alarm();
+
 }
 
 
@@ -571,6 +628,11 @@ int get_transfer_fd(session_t *sess)
 		sess->port_addr = NULL;
 	}
 
+	if (ret)
+	{
+		// 重新安装SIGALRM信号，并启动闹钟
+		start_data_alarm();
+	}
 	return ret;
 }
 
@@ -844,7 +906,7 @@ static void do_retr(session_t *sess)
 			flag = 2;
 			break;
 		}
-		
+
 		limit_rate(sess, ret, 0);
 		bytes_to_send -= ret;
 	}
@@ -879,6 +941,9 @@ static void do_retr(session_t *sess)
 		// 426
 		ftp_reply(sess, FTP_BADSENDNET, "Failure writting to network stream.");
 	}
+
+	// 重新开启控制连接通道闹钟
+	start_cmdio_alarm();
 
 
 }
@@ -1084,9 +1149,48 @@ static void do_help(session_t *sess)
 
 static void do_site_chmod(session_t *sess, char *chmod_arg)
 {
+	// SITE CHMOD <perm> <file>
+	if (strlen(chmod_arg) == 0)
+	{
+		ftp_reply(sess, FTP_BADCMD, "SITE CHMOD needs 2 arguments.");
+		return;
+	}
 
+	char perm[100] = {0};
+	char file[100] = {0};
+	str_split(chmod_arg , perm, file, ' ');
+	if (strlen(file) == 0)
+	{
+		ftp_reply(sess, FTP_BADCMD, "SITE CHMOD needs 2 arguments.");
+		return;
+	}
+
+	unsigned int mode = str_octal_to_uint(perm);
+	if (chmod(file, mode) < 0)
+	{
+		ftp_reply(sess, FTP_CHMODOK, "SITE CHMOD command failed.");
+	}
+	else
+	{
+		ftp_reply(sess, FTP_CHMODOK, "SITE CHMOD command ok.");
+	}
 }
+
 static void do_site_umask(session_t *sess, char *umask_arg)
 {
-
+	// SITE UMASK [umask]
+	if (strlen(umask_arg) == 0)
+	{
+		char text[1024] = {0};
+		sprintf(text, "Your current UMASK is 0%o", tunable_local_umask);
+		ftp_reply(sess, FTP_UMASKOK, text);
+	}
+	else
+	{
+		unsigned int um = str_octal_to_uint(umask_arg);
+		umask(um);
+		char text[1024] = {0};
+		sprintf(text, "UMASK set to 0%o", um);
+		ftp_reply(sess, FTP_UMASKOK, text);
+	}
 }
