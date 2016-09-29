@@ -229,6 +229,143 @@ int list_common(session_t *sess, int detail)
 	return 1;
 }
 
+void upload_common(session_t *sess, int is_append)
+{
+	// 创建数据连接
+	if (get_transfer_fd(sess) == 0)
+	{
+		return;
+	}
+
+	long long offset = sess->restart_pos;
+	sess->restart_pos = 0;
+
+	// 打开文件
+	int fd = open(sess->arg, O_CREAT | O_WRONLY, 0666);
+	if (fd == -1)
+	{
+		ftp_reply(sess, FTP_UPLOADFAIL, "Could not create file.");
+		return;
+	}
+
+	int ret;
+	// 加写锁
+	ret = lock_file_write(fd);
+	if (ret == -1)
+	{
+		ftp_reply(sess, FTP_UPLOADFAIL, "Could not create file.");
+		return;
+	}
+
+	// STOR
+	// REST+STOR
+	// APPE
+	if (!is_append && offset == 0)		// STOR
+	{
+		ftruncate(fd, 0);
+		if (lseek(fd, 0, SEEK_SET) < 0)
+		{
+			ftp_reply(sess, FTP_UPLOADFAIL, "Could not create file.");
+			return;
+		}
+	}
+	else if (!is_append && offset != 0)		// REST+STOR
+	{
+		if (lseek(fd, offset, SEEK_SET) < 0)
+		{
+			ftp_reply(sess, FTP_UPLOADFAIL, "Could not create file.");
+			return;
+		}
+	}
+	else if (is_append)				// APPE
+	{
+		if (lseek(fd, 0, SEEK_END) < 0)
+		{
+			ftp_reply(sess, FTP_UPLOADFAIL, "Could not create file.");
+			return;
+		}
+	}
+	struct stat sbuf;
+	ret = fstat(fd, &sbuf);
+	if (!S_ISREG(sbuf.st_mode))
+	{
+		ftp_reply(sess, FTP_UPLOADFAIL, "Could not create file.");
+		return;
+	}
+
+	// 150
+	char text[1024] = {0};
+	if (sess->is_ascii)
+	{
+		sprintf(text, "Opening ASCII mode data connection for %s (%lld bytes).",
+			sess->arg, (long long)sbuf.st_size);
+	}
+	else
+	{
+		sprintf(text, "Opening BINARY mode data connection for %s (%lld bytes).",
+			sess->arg, (long long)sbuf.st_size);
+	}
+
+	ftp_reply(sess, FTP_DATACONN, text);
+
+	int flag = 0;
+	// 上传文件
+
+	char buf[1024];
+
+	while (1)
+	{
+		ret = read(sess->data_fd, buf, sizeof(buf));
+		if (ret == -1)
+		{
+			if (errno == EINTR)
+			{
+				continue;
+			}
+			else
+			{
+				flag = 2;
+				break;
+			}
+		}
+		else if (ret == 0)
+		{
+			flag = 0;
+			break;
+		}
+
+		if (writen(fd, buf, ret) != ret)
+		{
+			flag = 1;
+			break;
+		}
+	}
+
+
+	// 关闭数据套接字
+	close(sess->data_fd);
+	sess->data_fd = -1;
+
+	close(fd);
+
+	if (flag == 0)
+	{
+		// 226
+		ftp_reply(sess, FTP_TRANSFEROK, "Transfer complete.");
+	}
+	else if (flag == 1)
+	{
+		// 451
+		ftp_reply(sess, FTP_BADSENDFILE, "Failure writting to local file.");
+	}
+	else if (flag == 2)
+	{
+		// 426
+		ftp_reply(sess, FTP_BADSENDNET, "Failure reading from network stream.");
+	}
+
+}
+
 int port_active(session_t *sess)
 {
 	if (sess->port_addr)
@@ -592,7 +729,7 @@ static void do_retr(session_t *sess)
 	int flag = 0;
 	// 下载文件
 
-	char buf[4096];
+	/*char buf[4096];
 
 	while (1)
 	{
@@ -620,11 +757,39 @@ static void do_retr(session_t *sess)
 			flag = 2;
 			break;
 		}
-	}
+	}*/
 	
 
 	//ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t count);
+	long long bytes_to_send = sbuf.st_size;
+	if (offset > bytes_to_send)
+	{
+		bytes_to_send = 0;
+	}
+	else
+	{
+		bytes_to_send -= offset;
+	}
+
 	
+	while (bytes_to_send)
+	{
+		int num_this_time = bytes_to_send > 4096 ? 4096 : bytes_to_send;
+		ret = sendfile(sess->data_fd, fd, NULL, num_this_time);
+		if (ret == -1)
+		{
+			flag = 2;
+			break;
+		}
+
+		bytes_to_send -= ret;
+	}
+
+	if (bytes_to_send == 0)
+	{
+		flag = 0;
+	}
+
 	// 关闭数据套接字
 	close(sess->data_fd);
 	sess->data_fd = -1;
@@ -653,12 +818,12 @@ static void do_retr(session_t *sess)
 }
 static void do_stor(session_t *sess)
 {
-
+	upload_common(sess, 0);
 }
 
 static void do_appe(session_t *sess)
 {
-
+	upload_common(sess, 1);
 }
 static void do_list(session_t *sess)
 {
