@@ -1,6 +1,8 @@
 #ifndef _SESSION_H_
 #define _SESSION_H_
+
 #include "common.h"
+
 typedef struct session
 {
 	// 控制连接
@@ -37,6 +39,7 @@ typedef struct session
 	unsigned int num_clients;
 	unsigned int num_this_ip;
 } session_t;
-void begin_session(session_t* sess);
 
-#endif /* _SESSION_H_*/
+void begin_session(session_t *sess);
+
+#endif /* _SESSION_H_ */

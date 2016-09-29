@@ -4,8 +4,10 @@
 #include "common.h"
 
 /*系统工具模块，目前与系统调用相关的函数还没有在这里封装完毕*/
+
 int tcp_client(unsigned short port);
 int tcp_server(const char *host, unsigned short port);
+
 int getlocalip(char *ip);
 
 void activate_nonblock(int fd);
@@ -35,5 +37,7 @@ long get_time_sec(void);
 long get_time_usec(void);
 void nano_sleep(double seconds);
 
+void activate_oobinline(int fd);
+void activate_sigurg(int fd);
 #endif /* _SYS_UTIL_H_ */
 

@@ -1,6 +1,5 @@
 #include "sysutil.h"
 
-
 int tcp_client(unsigned short port)
 {
 	int sock;
@@ -26,6 +25,7 @@ int tcp_client(unsigned short port)
 
 	return sock;
 }
+
 /**
  * tcp_server - 启动tcp服务器
  * @host: 服务器IP地址或者服务器主机名
@@ -35,37 +35,23 @@ int tcp_client(unsigned short port)
 int tcp_server(const char *host, unsigned short port)
 {
 	int listenfd;
-	if((listenfd = socket(PF_INET,SOCK_STREAM,0)) < 0)
-		ERR_EXIT("socket");
+	if ((listenfd = socket(PF_INET, SOCK_STREAM, 0)) < 0)
+		ERR_EXIT("tcp_server");
 
 	struct sockaddr_in servaddr;
-	memset(&servaddr,0,sizeof(servaddr));
+	memset(&servaddr, 0, sizeof(servaddr));
 	servaddr.sin_family = AF_INET;
-
-/*
-
-struct hostent {
-       char  *h_name;            
-       char **h_aliases;         
-       int    h_addrtype;        
-       int    h_length;          
-       char **h_addr_list;       
-};
-#define h_addr h_addr_list[0] 
-*/
-
-	if(host != NULL)
+	if (host != NULL)
 	{
-		if(inet_aton(host,&(servaddr.sin_addr)) == 0)
+		if (inet_aton(host, &servaddr.sin_addr) == 0)
 		{
 			struct hostent *hp;
 			hp = gethostbyname(host);
-			if(hp == NULL)
+			if (hp == NULL)
 				ERR_EXIT("gethostbyname");
-			servaddr.sin_addr = *(struct in_addr*)hp->h_addr; 
-		
-		}
 
+			servaddr.sin_addr = *(struct in_addr*)hp->h_addr;
+		}
 	}
 	else
 		servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -73,13 +59,13 @@ struct hostent {
 	servaddr.sin_port = htons(port);
 
 	int on = 1;
-	if(setsockopt(listenfd,SOL_SOCKET,SO_REUSEADDR,(const char*)&on,sizeof(on)) < 0)
+	if ((setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, (const char*)&on, sizeof(on))) < 0)
 		ERR_EXIT("setsockopt");
 
-	if(bind(listenfd,(struct sockaddr*)&servaddr,sizeof(servaddr)) < 0)
+	if (bind(listenfd, (struct sockaddr*)&servaddr, sizeof(servaddr)) < 0)
 		ERR_EXIT("bind");
-	
-	if(listen(listenfd,SOMAXCONN) < 0)
+
+	if (listen(listenfd, SOMAXCONN) < 0)
 		ERR_EXIT("listen");
 
 	return listenfd;
@@ -93,7 +79,7 @@ int getlocalip(char *ip)
 		return -1;
 	struct hostent *hp;
 	if ((hp = gethostbyname(host)) == NULL)
-		return -1;
+	return -1;
 
 	strcpy(ip, inet_ntoa(*(struct in_addr*)hp->h_addr));
 	return 0;
@@ -704,4 +690,28 @@ void nano_sleep(double seconds)
 		ret = nanosleep(&ts, &ts);
 	}
 	while (ret == -1 && errno == EINTR);
+}
+
+// 开启套接字fd接收带外数据的功能
+void activate_oobinline(int fd)
+{
+	int oob_inline = 1;
+	int ret;
+	ret = setsockopt(fd, SOL_SOCKET, SO_OOBINLINE, &oob_inline, sizeof(oob_inline));
+	if (ret == -1)
+	{
+		ERR_EXIT("setsockopt");
+	}
+}
+
+// 当文件描述fd上有带外数据的时候，将产生SIGURG信号，
+// 该函数设定当前进程能够接收fd文件描述符所产生的SIGURG信号
+void activate_sigurg(int fd)
+{
+	int ret;
+	ret = fcntl(fd, F_SETOWN, getpid());
+	if (ret == -1)
+	{
+		ERR_EXIT("fcntl");
+	}
 }

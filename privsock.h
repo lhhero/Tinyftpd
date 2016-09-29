@@ -38,4 +38,3 @@ int priv_sock_recv_fd(int sock_fd);
 
 
 #endif /* _PRIV_SOCK_H_ */
-

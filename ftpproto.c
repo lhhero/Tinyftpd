@@ -1,21 +1,30 @@
 #include "ftpproto.h"
-#include "common.h"
 #include "sysutil.h"
 #include "str.h"
 #include "ftpcodes.h"
 #include "tunable.h"
 #include "privsock.h"
 
-void ftp_reply(session_t *sess, int status, const char *text);
-void ftp_lreply(session_t *sess, int status, const char *text);
-int list_common(session_t *sess, int detail);
-int pasv_active(session_t *sess);
-int port_active(session_t *sess);
 
-void handle_sigalrm(int sig);
-void start_data_alarm(void);
-void start_cmdio_alarm(void);
+void ftp_lreply(session_t *sess, int status, const char *text);
+
 void handle_alarm_timeout(int sig);
+void handle_sigalrm(int sig);
+void handle_sigurg(int sig);
+void start_cmdio_alarm(void);
+void start_data_alarm(void);
+
+void check_abor(session_t *sess);
+
+int list_common(session_t *sess, int detail);
+void limit_rate(session_t *sess, int bytes_transfered, int is_upload);
+void upload_common(session_t *sess, int is_append);
+
+int get_port_fd(session_t *sess);
+int get_pasv_fd(session_t *sess);
+int get_transfer_fd(session_t *sess);
+int port_active(session_t *sess);
+int pasv_active(session_t *sess);
 
 static void do_user(session_t *sess);
 static void do_pass(session_t *sess);
@@ -52,7 +61,6 @@ static void do_help(session_t *sess);
 static void do_site_chmod(session_t *sess, char *chmod_arg);
 static void do_site_umask(session_t *sess, char *umask_arg);
 
-/*命令映射*/
 typedef struct ftpcmd
 {
 	const char *cmd;
@@ -109,6 +117,7 @@ static ftpcmd_t ctrl_cmds[] = {
 };
 
 session_t *p_sess;
+
 void handle_alarm_timeout(int sig)
 {
 	shutdown(p_sess->ctrl_fd, SHUT_RD);
@@ -116,6 +125,55 @@ void handle_alarm_timeout(int sig)
 	shutdown(p_sess->ctrl_fd, SHUT_WR);
 	exit(EXIT_FAILURE);
 }
+
+void handle_sigalrm(int sig)
+{
+	if (!p_sess->data_process)
+	{
+		ftp_reply(p_sess, FTP_DATA_TIMEOUT, "Data timeout. Reconnect. Sorry.");
+		exit(EXIT_FAILURE);
+	}
+
+	// 否则，当前处于数据传输的状态收到了超时信号
+	p_sess->data_process = 0;
+	start_data_alarm();
+}
+
+void handle_sigurg(int sig)
+{
+	if (p_sess->data_fd == -1)
+	{
+		return;
+	}
+
+	char cmdline[MAX_COMMAND_LINE] = {0};
+	int ret = readline(p_sess->ctrl_fd, cmdline, MAX_COMMAND_LINE);
+	if (ret <= 0)
+	{
+		ERR_EXIT("readline");
+	}
+	str_trim_crlf(cmdline);
+	if (strcmp(cmdline, "ABOR") == 0
+		|| strcmp(cmdline, "\377\364\377\362ABOR") == 0)
+	{
+		p_sess->abor_received = 1;
+		shutdown(p_sess->data_fd, SHUT_RDWR);
+	}
+	else
+	{
+		ftp_reply(p_sess, FTP_BADCMD, "Unknown command.");
+	}
+}
+
+void check_abor(session_t *sess)
+{
+	if (sess->abor_received)
+	{
+		sess->abor_received = 0;
+		ftp_reply(p_sess, FTP_ABOROK, "ABOR successful.");
+	}
+}
+
 void start_cmdio_alarm(void)
 {
 	if (tunable_idle_session_timeout > 0)
@@ -126,6 +184,7 @@ void start_cmdio_alarm(void)
 		alarm(tunable_idle_session_timeout);
 	}
 }
+
 void start_data_alarm(void)
 {
 	if (tunable_data_connection_timeout > 0)
@@ -141,50 +200,45 @@ void start_data_alarm(void)
 		alarm(0);
 	}
 }
-void handle_sigalrm(int sig)
+
+void handle_child(session_t *sess)
 {
-	if (!p_sess->data_process)
-	{
-		ftp_reply(p_sess, FTP_DATA_TIMEOUT, "Data timeout. Reconnect. Sorry.");
-		exit(EXIT_FAILURE);
-	}
-
-	// 否则，当前处于数据传输的状态收到了超时信号
-	p_sess->data_process = 0;
-	start_data_alarm();
-}
-
-
-
-void handler_child(session_t* sess)
-{
+	ftp_reply(sess, FTP_GREET, "(miniftpd 0.1)");
 	int ret;
-	writen(sess->ctrl_fd,"220 (Tinyftpd 0.1v)\r\n",strlen("220 (Tinyftpd 0.1v)\r\n"));
-	while(1)
+	while (1)
 	{
-		memset(sess->cmdline,0,MAX_COMMAND_LINE);
-		memset(sess->cmd,0,MAX_COMMAND);
-		memset(sess->arg,0,MAX_ARG);
+		memset(sess->cmdline, 0, sizeof(sess->cmdline));
+		memset(sess->cmd, 0, sizeof(sess->cmd));
+		memset(sess->arg, 0, sizeof(sess->arg));
 
 		start_cmdio_alarm();
-		ret = readline(sess->ctrl_fd,sess->cmdline,sizeof(sess->cmdline));
-		if(ret == -1)
+		ret = readline(sess->ctrl_fd, sess->cmdline, MAX_COMMAND_LINE);
+		if (ret == -1)
 			ERR_EXIT("readline");
-		if(ret == 0)
+		else if (ret == 0)
 			exit(EXIT_SUCCESS);
 
-		//解析ftp命令和参数
+		printf("cmdline=[%s]\n", sess->cmdline);
+		// 去除\r\n
 		str_trim_crlf(sess->cmdline);
-		str_split(sess->cmdline,sess->cmd,sess->arg,' ');
-		printf("[cmd]=%s,[arg]=%s\n",sess->cmd,sess->arg);
+		printf("cmdline=[%s]\n", sess->cmdline);
+		// 解析FTP命令与参数
+		str_split(sess->cmdline, sess->cmd, sess->arg, ' ');
+		printf("cmd=[%s] arg=[%s]\n", sess->cmd, sess->arg);
+		// 将命令转换为大写
 		str_upper(sess->cmd);
-
-		/*if(strcmp(sess->cmd,"USER") == 0)
+		// 处理FTP命令
+		/*
+		if (strcmp("USER", sess->cmd) == 0)
+		{
 			do_user(sess);
-		else if(strcmp(sess->cmd,"PASS") == 0)
-			do_pass(sess);*/
+		}
+		else if (strcmp("PASS", sess->cmd) == 0)
+		{
+			do_pass(sess);
+		}
+		*/
 
-		// 处理FTP命令,命令映射
 		int i;
 		int size = sizeof(ctrl_cmds) / sizeof(ctrl_cmds[0]);
 		for (i=0; i<size; i++)
@@ -208,7 +262,6 @@ void handler_child(session_t* sess)
 		{
 			ftp_reply(sess, FTP_BADCMD, "Unknown command.");
 		}
-		
 	}
 }
 
@@ -224,6 +277,63 @@ void ftp_lreply(session_t *sess, int status, const char *text)
 	char buf[1024] = {0};
 	sprintf(buf, "%d-%s\r\n", status, text);
 	writen(sess->ctrl_fd, buf, strlen(buf));
+}
+
+int list_common(session_t *sess, int detail)
+{
+	DIR *dir = opendir(".");
+	if (dir == NULL)
+	{
+		return 0;
+	}
+
+	struct dirent *dt;
+	struct stat sbuf;
+	while ((dt = readdir(dir)) != NULL)
+	{
+		if (lstat(dt->d_name, &sbuf) < 0)
+		{
+			continue;
+		}
+		if (dt->d_name[0] == '.')
+			continue;
+
+		char buf[1024] = {0};
+		if (detail)
+		{
+			const char *perms = statbuf_get_perms(&sbuf);
+
+			
+			int off = 0;
+			off += sprintf(buf, "%s ", perms);
+			off += sprintf(buf + off, " %3d %-8d %-8d ", sbuf.st_nlink, sbuf.st_uid, sbuf.st_gid);
+			off += sprintf(buf + off, "%8lu ", (unsigned long)sbuf.st_size);
+
+			const char *datebuf = statbuf_get_date(&sbuf);
+			off += sprintf(buf + off, "%s ", datebuf);
+			if (S_ISLNK(sbuf.st_mode))
+			{
+				char tmp[1024] = {0};
+				readlink(dt->d_name, tmp, sizeof(tmp));
+				off += sprintf(buf + off, "%s -> %s\r\n", dt->d_name, tmp);
+			}
+			else
+			{
+				off += sprintf(buf + off, "%s\r\n", dt->d_name);
+			}
+		}
+		else
+		{
+			sprintf(buf, "%s\r\n", dt->d_name);
+		}
+		
+		//printf("%s", buf);
+		writen(sess->data_fd, buf, strlen(buf));
+	}
+
+	closedir(dir);
+
+	return 1;
 }
 
 void limit_rate(session_t *sess, int bytes_transfered, int is_upload)
@@ -281,62 +391,6 @@ void limit_rate(session_t *sess, int bytes_transfered, int is_upload)
 	sess->bw_transfer_start_sec = get_time_sec();
 	sess->bw_transfer_start_usec = get_time_usec();
 
-}
-int list_common(session_t *sess, int detail)
-{
-	DIR *dir = opendir(".");
-	if (dir == NULL)
-	{
-		return 0;
-	}
-
-	struct dirent *dt;
-	struct stat sbuf;
-	while ((dt = readdir(dir)) != NULL)
-	{
-		if (lstat(dt->d_name, &sbuf) < 0)
-		{
-			continue;
-		}
-		if (dt->d_name[0] == '.')
-			continue;
-
-		char buf[1024] = {0};
-		if (detail)
-		{
-			const char *perms = statbuf_get_perms(&sbuf);
-
-			
-			int off = 0;
-			off += sprintf(buf, "%s ", perms);
-			off += sprintf(buf + off, " %3d %-8d %-8d ", sbuf.st_nlink, sbuf.st_uid, sbuf.st_gid);
-			off += sprintf(buf + off, "%8lu ", (unsigned long)sbuf.st_size);
-
-			const char *datebuf = statbuf_get_date(&sbuf);
-			off += sprintf(buf + off, "%s ", datebuf);
-			if (S_ISLNK(sbuf.st_mode))
-			{
-				char tmp[1024] = {0};
-				readlink(dt->d_name, tmp, sizeof(tmp));
-				off += sprintf(buf + off, "%s -> %s\r\n", dt->d_name, tmp);
-			}
-			else
-			{
-				off += sprintf(buf + off, "%s\r\n", dt->d_name);
-			}
-		}
-		else
-		{
-			sprintf(buf, "%s\r\n", dt->d_name);
-		}
-		
-		//printf("%s", buf);
-		writen(sess->data_fd, buf, strlen(buf));
-	}
-
-	closedir(dir);
-
-	return 1;
 }
 
 void upload_common(session_t *sess, int is_append)
@@ -448,6 +502,11 @@ void upload_common(session_t *sess, int is_append)
 		}
 
 		limit_rate(sess, ret, 1);
+		if (sess->abor_received)
+		{
+			flag = 2;
+			break;
+		}
 
 		if (writen(fd, buf, ret) != ret)
 		{
@@ -463,7 +522,7 @@ void upload_common(session_t *sess, int is_append)
 
 	close(fd);
 
-	if (flag == 0)
+	if (flag == 0 && !sess->abor_received)
 	{
 		// 226
 		ftp_reply(sess, FTP_TRANSFEROK, "Transfer complete.");
@@ -479,9 +538,9 @@ void upload_common(session_t *sess, int is_append)
 		ftp_reply(sess, FTP_BADSENDNET, "Failure reading from network stream.");
 	}
 
+	check_abor(sess);
 	// 重新开启控制连接通道闹钟
 	start_cmdio_alarm();
-
 }
 
 
@@ -502,8 +561,8 @@ int port_active(session_t *sess)
 
 int pasv_active(session_t *sess)
 {
-	
-	/*if (sess->pasv_listen_fd != -1)
+	/*
+	if (sess->pasv_listen_fd != -1)
 	{
 		if (port_active(sess))
 		{
@@ -511,8 +570,8 @@ int pasv_active(session_t *sess)
 			exit(EXIT_FAILURE);
 		}
 		return 1;
-	}*/
-	
+	}
+	*/
 	priv_sock_send_cmd(sess->child_fd, PRIV_SOCK_PASV_ACTIVE);
 	int active = priv_sock_get_int(sess->child_fd);
 	if (active)
@@ -531,12 +590,11 @@ int get_port_fd(session_t *sess)
 {
 	/*
 	向nobody发送PRIV_SOCK_GET_DATA_SOCK命令        1
-	向nobody发送一个整数port		               4
+	向nobody发送一个整数port		       4
 	向nobody发送一个字符串ip                       不定长
 	*/
 
 	priv_sock_send_cmd(sess->child_fd, PRIV_SOCK_GET_DATA_SOCK);
-
 	unsigned short port = ntohs(sess->port_addr->sin_port);
 	char *ip = inet_ntoa(sess->port_addr->sin_addr);
 	priv_sock_send_int(sess->child_fd, (int)port);
@@ -576,12 +634,12 @@ int get_transfer_fd(session_t *sess)
 	// 检测是否收到PORT或者PASV命令
 	if (!port_active(sess) && !pasv_active(sess))
 	{
+		//printf("yyyyyyyyyyyyyyyy\n");
 		ftp_reply(sess, FTP_BADSENDCONN, "Use PORT or PASV first.");
 		return 0;
 	}
 
 	int ret = 1;
-
 	// 如果是主动模式
 	if (port_active(sess))
 	{
@@ -601,24 +659,33 @@ int get_transfer_fd(session_t *sess)
 			return 0;
 		}
 
-		sess->data_fd = fd;*/
-		
+		sess->data_fd = fd;
+		*/
+
 		if (get_port_fd(sess) == 0)
 		{
 			ret = 0;
 		}
 	}
 
-	//如果是被动模式
-	if(pasv_active(sess))
+	if (pasv_active(sess))
 	{
-		int fd = accept_timeout(sess->pasv_listen_fd,NULL,tunable_accept_timeout);
+		/*
+		int fd = accept_timeout(sess->pasv_listen_fd, NULL, tunable_accept_timeout);
 		close(sess->pasv_listen_fd);
-		if(fd == -1)
+
+		if (fd == -1)
 		{
 			return 0;
-		}	
+		}
+
 		sess->data_fd = fd;
+		*/
+		if (get_pasv_fd(sess) == 0)
+		{
+			ret = 0;
+		}
+
 	}
 
 	
@@ -633,13 +700,13 @@ int get_transfer_fd(session_t *sess)
 		// 重新安装SIGALRM信号，并启动闹钟
 		start_data_alarm();
 	}
+
 	return ret;
 }
 
-
 static void do_user(session_t *sess)
 {
-	//USER HiiL
+	//USER jjl
 	struct passwd *pw = getpwnam(sess->arg);
 	if (pw == NULL)
 	{
@@ -655,7 +722,7 @@ static void do_user(session_t *sess)
 
 static void do_pass(session_t *sess)
 {
-	// PASS 071215
+	// PASS 123456
 	struct passwd *pw = getpwuid(sess->uid);
 	if (pw == NULL)
 	{
@@ -672,7 +739,6 @@ static void do_pass(session_t *sess)
 		return;
 	}
 
-
 	// 将明文进行加密
 	char *encrypted_pass = crypt(sess->arg, sp->sp_pwdp);
 	// 验证密码
@@ -682,6 +748,10 @@ static void do_pass(session_t *sess)
 		return;
 	}
 
+	signal(SIGURG, handle_sigurg);
+	activate_sigurg(sess->ctrl_fd);
+
+	umask(tunable_local_umask);
 	setegid(pw->pw_gid);
 	seteuid(pw->pw_uid);
 	chdir(pw->pw_dir);
@@ -715,6 +785,7 @@ static void do_quit(session_t *sess)
 	ftp_reply(sess, FTP_GOODBYE, "Goodbye.");
 	exit(EXIT_SUCCESS);
 }
+
 static void do_port(session_t *sess)
 {
 	//PORT 192,168,0,100,123,233
@@ -736,14 +807,15 @@ static void do_port(session_t *sess)
 
 	ftp_reply(sess, FTP_PORTOK, "PORT command successful. Consider using PASV.");
 }
+
 static void do_pasv(session_t *sess)
 {
-	//Entering Passive Mode (192,168,199,176,141,250).
-	//
-	//要修改/etc/hosts文件，不然无法获取本机IP192.168.199.176
+	//Entering Passive Mode (192,168,244,100,101,46).
+
 	char ip[16] = {0};
 	getlocalip(ip);
 
+/*
 	sess->pasv_listen_fd = tcp_server(ip, 0);
 	struct sockaddr_in addr;
 	socklen_t addrlen = sizeof(addr);
@@ -753,7 +825,12 @@ static void do_pasv(session_t *sess)
 	}
 
 	unsigned short port = ntohs(addr.sin_port);
-	
+	*/
+
+	priv_sock_send_cmd(sess->child_fd, PRIV_SOCK_PASV_LISTEN);
+	unsigned short port = (int)priv_sock_get_int(sess->child_fd);
+
+
 	unsigned int v[4];
 	sscanf(ip, "%u.%u.%u.%u", &v[0], &v[1], &v[2], &v[3]);
 	char text[1024] = {0};
@@ -762,7 +839,9 @@ static void do_pasv(session_t *sess)
 
 	ftp_reply(sess, FTP_PASVOK, text);
 
+
 }
+
 static void do_type(session_t *sess)
 {
 	if (strcmp(sess->arg, "A") == 0)
@@ -781,8 +860,16 @@ static void do_type(session_t *sess)
 	}
 
 }
-//static void do_stru(session_t *sess);
-//static void do_mode(session_t *sess);
+/*
+static void do_stru(session_t *sess)
+{
+}
+
+static void do_mode(session_t *sess)
+{
+}
+*/
+
 static void do_retr(session_t *sess)
 {
 	// 下载文件
@@ -833,7 +920,7 @@ static void do_retr(session_t *sess)
 		}
 	}
 
-//150 Opening BINARY mode data connection
+//150 Opening BINARY mode data connection for /home/jjl/tmp/echocli.c (1085 bytes).
 
 	// 150
 	char text[1024] = {0};
@@ -881,9 +968,11 @@ static void do_retr(session_t *sess)
 			flag = 2;
 			break;
 		}
-	}*/
+	}
+	*/
 
-	//ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t count);
+	// ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t count);
+
 	long long bytes_to_send = sbuf.st_size;
 	if (offset > bytes_to_send)
 	{
@@ -896,7 +985,6 @@ static void do_retr(session_t *sess)
 
 	sess->bw_transfer_start_sec = get_time_sec();
 	sess->bw_transfer_start_usec = get_time_usec();
-	
 	while (bytes_to_send)
 	{
 		int num_this_time = bytes_to_send > 4096 ? 4096 : bytes_to_send;
@@ -908,10 +996,14 @@ static void do_retr(session_t *sess)
 		}
 
 		limit_rate(sess, ret, 0);
+		if (sess->abor_received)
+		{
+			flag = 2;
+			break;
+		}
+
 		bytes_to_send -= ret;
 	}
-
-	
 
 	if (bytes_to_send == 0)
 	{
@@ -926,7 +1018,7 @@ static void do_retr(session_t *sess)
 
 	
 
-	if (flag == 0)
+	if (flag == 0 && !sess->abor_received)
 	{
 		// 226
 		ftp_reply(sess, FTP_TRANSFEROK, "Transfer complete.");
@@ -942,11 +1034,12 @@ static void do_retr(session_t *sess)
 		ftp_reply(sess, FTP_BADSENDNET, "Failure writting to network stream.");
 	}
 
+	check_abor(sess);
 	// 重新开启控制连接通道闹钟
 	start_cmdio_alarm();
-
-
+	
 }
+
 static void do_stor(session_t *sess)
 {
 	upload_common(sess, 0);
@@ -956,6 +1049,7 @@ static void do_appe(session_t *sess)
 {
 	upload_common(sess, 1);
 }
+
 static void do_list(session_t *sess)
 {
 	// 创建数据连接
@@ -963,7 +1057,7 @@ static void do_list(session_t *sess)
 	{
 		return;
 	}
-	// 150 
+	// 150
 	ftp_reply(sess, FTP_DATACONN, "Here comes the directory listing.");
 
 	// 传输列表
@@ -973,9 +1067,12 @@ static void do_list(session_t *sess)
 	sess->data_fd = -1;
 	// 226
 	ftp_reply(sess, FTP_TRANSFEROK, "Directory send OK.");
+
+
 }
+
 static void do_nlst(session_t *sess)
-{	
+{
 	// 创建数据连接
 	if (get_transfer_fd(sess) == 0)
 	{
@@ -991,8 +1088,8 @@ static void do_nlst(session_t *sess)
 	sess->data_fd = -1;
 	// 226
 	ftp_reply(sess, FTP_TRANSFEROK, "Directory send OK.");
-
 }
+
 static void do_rest(session_t *sess)
 {
 	sess->restart_pos = str_to_longlong(sess->arg);
@@ -1000,6 +1097,7 @@ static void do_rest(session_t *sess)
 	sprintf(text, "Restart position accepted (%lld).", sess->restart_pos);
 	ftp_reply(sess, FTP_RESTOK, text);
 }
+
 static void do_abor(session_t *sess)
 {
 	ftp_reply(sess, FTP_ABOR_NOCONN, "No transfer to ABOR");
@@ -1015,6 +1113,7 @@ static void do_pwd(session_t *sess)
 
 	ftp_reply(sess, FTP_PWDOK, text);
 }
+
 static void do_mkd(session_t *sess)
 {
 	// 0777 & umask
@@ -1045,6 +1144,7 @@ static void do_mkd(session_t *sess)
 
 	ftp_reply(sess, FTP_MKDIROK, text);
 }
+
 static void do_rmd(session_t *sess)
 {
 	if (rmdir(sess->arg) < 0)
@@ -1053,7 +1153,9 @@ static void do_rmd(session_t *sess)
 	}
 
 	ftp_reply(sess, FTP_RMDIROK, "Remove directory operation successful.");
+
 }
+
 static void do_dele(session_t *sess)
 {
 	if (unlink(sess->arg) < 0)
@@ -1064,6 +1166,7 @@ static void do_dele(session_t *sess)
 
 	ftp_reply(sess, FTP_DELEOK, "Delete operation successful.");
 }
+
 static void do_rnfr(session_t *sess)
 {
 	sess->rnfr_name = (char *)malloc(strlen(sess->arg) + 1);
@@ -1071,18 +1174,58 @@ static void do_rnfr(session_t *sess)
 	strcpy(sess->rnfr_name, sess->arg);
 	ftp_reply(sess, FTP_RNFROK, "Ready for RNTO.");
 }
+
 static void do_rnto(session_t *sess)
 {
+	if (sess->rnfr_name == NULL)
+	{
+		ftp_reply(sess, FTP_NEEDRNFR, "RNFR required first.");
+		return;
+	}
 
+	rename(sess->rnfr_name, sess->arg);
+
+	ftp_reply(sess, FTP_RENAMEOK, "Rename successful.");
+
+	free(sess->rnfr_name);
+	sess->rnfr_name = NULL;
 }
+
+
 static void do_site(session_t *sess)
 {
+	// SITE CHMOD <perm> <file>
+	// SITE UMASK [umask]
+	// SITE HELP
+
+	char cmd[100] = {0};
+	char arg[100] = {0};
+
+	str_split(sess->arg , cmd, arg, ' ');
+	if (strcmp(cmd, "CHMOD") == 0)
+	{
+		do_site_chmod(sess, arg);
+	}
+	else if (strcmp(cmd, "UMASK") == 0)
+	{
+		do_site_umask(sess, arg);
+	}
+	else if (strcmp(cmd, "HELP") == 0)
+	{
+		ftp_reply(sess, FTP_SITEHELP, "CHMOD UMASK HELP");
+	}
+	else
+	{
+		 ftp_reply(sess, FTP_BADCMD, "Unknown SITE command.");
+	}
 
 }
+
 static void do_syst(session_t *sess)
 {
 	ftp_reply(sess, FTP_SYSTOK, "UNIX Type: L8");
 }
+
 static void do_feat(session_t *sess)
 {
 	ftp_lreply(sess, FTP_FEAT, "Features:");
@@ -1096,6 +1239,7 @@ static void do_feat(session_t *sess)
 	writen(sess->ctrl_fd, " UTF8\r\n", strlen(" UTF8\r\n"));
 	ftp_reply(sess, FTP_FEAT, "End");
 }
+
 static void do_size(session_t *sess)
 {
 	//550 Could not get file size.
@@ -1117,9 +1261,49 @@ static void do_size(session_t *sess)
 	sprintf(text, "%lld", (long long)buf.st_size);
 	ftp_reply(sess, FTP_SIZEOK, text);
 }
+
 static void do_stat(session_t *sess)
 {
+	ftp_lreply(sess, FTP_STATOK, "FTP server status:");
+	if (sess->bw_upload_rate_max == 0)
+	{
+		char text[1024];
+		sprintf(text,
+			"     No session upload bandwidth limit\r\n");
+		writen(sess->ctrl_fd, text, strlen(text));
+	}
+	else if (sess->bw_upload_rate_max > 0)
+	{
+		char text[1024];
+		sprintf(text,
+			"     Session upload bandwidth limit in byte/s is %u\r\n",
+			sess->bw_upload_rate_max);
+		writen(sess->ctrl_fd, text, strlen(text));
+	}
 
+	if (sess->bw_download_rate_max == 0)
+	{
+		char text[1024];
+		sprintf(text,
+			"     No session download bandwidth limit\r\n");
+		writen(sess->ctrl_fd, text, strlen(text));
+	}
+	else if (sess->bw_download_rate_max > 0)
+	{
+		char text[1024];
+		sprintf(text,
+			"     Session download bandwidth limit in byte/s is %u\r\n",
+			sess->bw_download_rate_max);
+		writen(sess->ctrl_fd, text, strlen(text));
+	}
+
+	char text[1024] = {0};
+	sprintf(text,
+		"     At session startup, client count was %u\r\n",
+		sess->num_clients);
+	writen(sess->ctrl_fd, text, strlen(text));
+	
+	ftp_reply(sess, FTP_STATOK, "End of status");
 }
 
 static void do_noop(session_t *sess)
@@ -1145,7 +1329,6 @@ static void do_help(session_t *sess)
 		strlen(" XPWD XRMD\r\n"));
 	ftp_reply(sess, FTP_HELP, "Help OK.");
 }
-
 
 static void do_site_chmod(session_t *sess, char *chmod_arg)
 {

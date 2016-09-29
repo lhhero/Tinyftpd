@@ -1,9 +1,10 @@
-#ifndef _FTPPROTO_H_
-#define _FTPPROTO_H_
+#ifndef _FTP_PROTO_H_
+#define _FTP_PROTO_H_
 
 #include "session.h"
 
-void handler_child(session_t* sess);
+void handle_child(session_t *sess);
+//int list_common(void);
+void ftp_reply(session_t *sess, int status, const char *text);
 
-
-#endif
+#endif /* _FTP_PROTO_H_ */
